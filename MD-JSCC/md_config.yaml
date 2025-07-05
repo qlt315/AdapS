@@ -1,0 +1,43 @@
+# Configuration for the "Shared Encoder + Multi-Decoder" Multi-Task JSCC training.
+
+# --- Hardware and Path Settings ---
+device: "cuda:0"
+out_dir: "MD-JSCC/out" # A new directory for this experiment
+parallel: false
+num_workers: 0                  # Set to 0 to avoid multiprocessing memory issues on Windows
+
+# --- Core Training Strategy ---
+# The dataset that defines the length of an epoch.
+base_dataset: "cifar10"
+# Fixed SNR and Ratio for this entire training run.
+fixed_snr: 7.0
+fixed_ratio: "1/6" # Use string format for fractions
+
+# --- Training Hyperparameters ---
+epochs: 200
+batch_size: 64
+init_lr: 0.0001       # A stable starting learning rate
+weight_decay: 0.0005
+eval_frequency: 5     # Run evaluation every 5 epochs
+
+# --- Scheduler Settings ---
+if_scheduler: true
+reduce_on_plateau: true
+lr_reduce_factor: 0.5
+lr_schedule_patience: 10
+min_lr: 0.000001
+
+# --- Individually Specified Task List ---
+# The Python script will read this list and create a separate, dedicated
+# decoder for each task defined below.
+training_tasks:
+  - dataset: 'cifar10'
+    channel: 'AWGN'
+  - dataset: 'cifar10_noise'
+    channel: 'AWGN'
+  - dataset: 'cifar10'
+    channel: 'Rayleigh'
+#  - dataset: 'cifar10_blur' # Example of a "contaminated" dataset
+#    channel: 'AWGN'
+#  - dataset: 'cifar10_blur'
+#    channel: 'Rayleigh'
