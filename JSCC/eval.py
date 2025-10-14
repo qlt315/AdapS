@@ -1,125 +1,137 @@
-import torch
-from utils import get_psnr
 import os
-from model import DeepJSCC
-from train import evaluate_epoch
-from torchvision import transforms
-from torchvision import datasets
-from torch.utils.data import DataLoader
-from dataset import Vanilla, Cifar10Modified
-import yaml
-from tensorboardX import SummaryWriter
-import glob
+import torch
+from datasets.dataloader import get_data
+import model.DT_JSCC as JSCC_model
+from utils.modulation import QAM, PSK
+from utils.accuracy import accuracy
 import argparse
-from utils import image_normalization
-import numpy as np
-import torch.nn as nn
-from tqdm import tqdm
+import re
 
-def eval_snr(model, test_loader, writer, param, args):
-    """
-    Evaluates the single-decoder JSCC model on a range of SNRs.
-    """
-    snr_list = range(0, 26, 1)  # Or use step=5 for faster eval
-    # snr_list = [7]
-    criterion = nn.MSELoss()
+def infer_num_classes(dataset_name: str) -> int:
+    name = dataset_name.upper()
+    if name.startswith("CIFAR100"):
+        return 100
+    if name.startswith("CIFAR10"):
+        return 10
+    if name.startswith("CINIC10"):
+        return 10
+    # fallback: keep user-specified value (or raise)
+    raise ValueError(f"Unknown dataset for inferring num_classes: {dataset_name}")
 
-    print(f"--- Evaluating JSCC Model ---")
-
-    for snr in tqdm(snr_list, desc=f"SNR Sweep"):
-        # Dynamically change channel per SNR
-        model.change_channel(args.eval_channel, snr)
-
-        total_mse = 0
-
-        for _ in range(args.times):
-            with torch.no_grad():
-                for images, _ in test_loader:
-                    images = images.to(param['device'])
-
-                    outputs = model(images)
-
-                    # Optional: Denormalize if your model works in [0,1] → [0,255]
-                    outputs = image_normalization('denormalization')(outputs)
-                    images = image_normalization('denormalization')(images)
-
-                    total_mse += criterion(outputs, images).item()
-
-        avg_mse = total_mse / (len(test_loader) * args.times)
-
-        psnr = 10 * np.log10(255 ** 2 / avg_mse) if avg_mse > 0 else float('inf')
-
-        # Log and print
-        writer.add_scalar('psnr', psnr, snr)
-        print(f"[Eval] SNR: {snr} dB | PSNR: {psnr:.2f} dB")
+def eval_test(dataloader, model, mod, args, psnr):
+    correct1 = correct3 = samples = 0
+    with torch.no_grad():
+        model.eval()
+        for imgs, labs in dataloader:
+            imgs, labs = imgs.to(args.device), labs.to(args.device)
+            outs, _ = model(imgs, mod=mod)
+            top1, top3 = accuracy(outs, labs, (1, 3))
+            bs = imgs.size(0)
+            correct1 += top1.item() / 100 * bs
+            correct3 += top3.item() / 100 * bs
+            samples += bs
+    acc1 = correct1 / samples * 100
+    acc3 = correct3 / samples * 100
+    print(f"[Eval] SNR = {psnr} dB | Acc@1 = {acc1:.4f} | Acc@3 = {acc3:.4f}")
+    return acc1, acc3
 
 
-def build_eval_loader(params, args):
-    transform = transforms.Compose([transforms.ToTensor()])
-    eval_dataset_name = args.eval_dataset
+def main(args):
+    print(f"\n[Config] Dataset: {args.dataset} | Modulation: {args.mod.upper()} | Channel: {args.channel.upper()}\n")
+    ds = str(args.dataset).strip().lower()
 
-    if eval_dataset_name == 'cifar10':
-        test_dataset = datasets.CIFAR10(root='dataset/', train=False, download=True, transform=transform)
-    elif eval_dataset_name == 'imagenet':
-        transform = transforms.Compose([transforms.ToTensor(), transforms.Resize((128, 128))])
-        test_dataset = Vanilla(root='dataset/ImageNet/val', transform=transform)
+    if re.match(r'^cifar100(\b|[_-])', ds):
+        model = JSCC_model.DTJSCC_CIFAR100(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif re.match(r'^cifar10(\b|[_-])', ds):
+        model = JSCC_model.DTJSCC_CIFAR10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif re.match(r'^cinic10(\b|[_-])', ds):
+        model = JSCC_model.DTJSCC_CINIC10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
     else:
-        # All custom CIFAR-10 variants go here
-        test_dataset = Cifar10Modified(eval_dataset_name, transform=transform, train=False)
+        raise ValueError(
+            f"No available model for dataset: {args.dataset}, please check model/DT_JSCC.py."
+        )
 
-    test_loader = DataLoader(test_dataset, shuffle=True,
-                             batch_size=params['batch_size'], num_workers=params['num_workers'])
-    return test_loader
+    dataloader_vali = get_data(args.dataset, 256, n_worker=8, train=False)
 
+    checkpoint = torch.load(args.model_path, map_location='cpu')
+    model.load_state_dict(checkpoint['model_states'])
+    model.to(args.device)
 
-def process_config(config_path, args):
-    with open(config_path, 'r') as f:
-        config = yaml.load(f, Loader=yaml.UnsafeLoader)
-        params = config['params']
-        c = config['inner_channel']
+    PSNRs = list(range(0, 26, 1))
+    acc1s, acc3s = [], []
 
-    test_loader = build_eval_loader(params, args)
-    model_name = args.model_dir
-    writer = SummaryWriter(os.path.join(args.output_dir, 'eval', model_name))
+    for psnr in PSNRs:
+        channel_args = {}
+        if args.channel == 'rician':
+            channel_args['K'] = args.K
+        elif args.channel == 'nakagami':
+            channel_args['m'] = args.m
 
-    model = DeepJSCC(c=c)
-    model = model.to(params['device'])
+        if args.mod == 'qam':
+            mod = QAM(args.num_embeddings, psnr, args.channel, channel_args)
+        elif args.mod == 'psk':
+            mod = PSK(args.num_embeddings, psnr, args.channel, channel_args)
+        else:
+            raise ValueError(f"Unsupported modulation: {args.mod}")
 
+        acc1_runs, acc3_runs = [], []
+        for _ in range(args.eval_times):
+            a1, a3 = eval_test(dataloader_vali, model, mod, args, psnr)
+            acc1_runs.append(a1)
+            acc3_runs.append(a3)
 
-    pkl_list = sorted(glob.glob(os.path.join(os.path.join(args.output_dir, 'checkpoints', model_name), '*.pkl')))
-    if not pkl_list:
-        raise FileNotFoundError(f"No checkpoint found in {os.path.join(args.output_dir, 'checkpoints', model_name)}")
-    model.load_state_dict(torch.load(pkl_list[-1]))
+        mean_acc1 = sum(acc1_runs) / args.eval_times
+        mean_acc3 = sum(acc3_runs) / args.eval_times
+        acc1s.append(mean_acc1)
+        acc3s.append(mean_acc3)
+        print(f"[Avg ] SNR = {psnr} dB | Acc@1 = {mean_acc1:.4f} | Acc@3 = {mean_acc3:.4f}\n")
 
-    eval_snr(model, test_loader, writer, params, args)
-    writer.close()
+    save_dict = {
+        'acc1s': acc1s,
+        'acc3s': acc3s,
+    }
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_dir', type=str,
-                        default='CIFAR10_8_7.0_0.17_AWGN_23h14m26s_on_Jun_19_2025',
-                        help='Directory containing checkpoint and config (e.g., JSCC/out/checkpoints/model_xxx)')
-    parser.add_argument('--eval_dataset', type=str, default='cifar10',
-                        help='Dataset name (e.g., cifar10, imagenet, cifar10_blur, etc.)')
-    parser.add_argument('--eval_channel', type=str, default='Rician',
-                        help='Channel type (e.g., Flip, Rayleigh)')
-    parser.add_argument('--output_dir', type=str, default='JSCC/out',
-                        help='Output directory containing configs and checkpoints')
-    parser.add_argument('--times', type=int, default=10,
-                        help='Number of evaluation repetitions')
-    args = parser.parse_args()
-
-    # Automatically find matching config file based on model_dir name
-    model_name = os.path.basename(args.model_dir)
-    config_path = os.path.join(args.output_dir, 'configs', model_name + '.yaml')
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    print(f"Processing config: {config_path}")
-    process_config(config_path, args)
+    result_file = f'{args.result_path}-eval-{args.dataset}-{args.channel}.pt'
+    torch.save(save_dict, result_file)
+    print(f"\n[Done] Results saved to {result_file}")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Evaluate trained JSCC model under varying PSNRs')
+    parser.add_argument('--mod', type=str, default='psk', help='Modulation type: psk or qam')
+    parser.add_argument('--num_latent', type=int, default=4)
+    parser.add_argument('--latent_d', type=int, default=512)
+    parser.add_argument('--dataset', type=str, default='CINIC10_noise')
+    parser.add_argument('--model_dir', type=str, default='JSCC/trained_models')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--num_embeddings', type=int, default=16)
+    parser.add_argument('--name', type=str, default='CINIC10-awgn')
+    parser.add_argument('--save_dir', type=str, default='JSCC/eval')
+    parser.add_argument('--channel', type=str, default='rician', choices=['awgn', 'rayleigh', 'rician', 'nakagami'])
+    parser.add_argument('--in_channels', type=int, default=3, help='The image input channel')
+    parser.add_argument('--K', type=float, default=3.0)
+    parser.add_argument('--m', type=float, default=2.0)
+    parser.add_argument('--eval_times', type=int, default=1, help='Number of evaluations per PSNR point')
+
+    args = parser.parse_args()
+    args.device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    args.num_classes = infer_num_classes(args.dataset)
+
+    model_dir = os.path.join(args.model_dir, args.name)
+    args.model_path = os.path.join(model_dir, 'best.pt')
+
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+
+    args.result_path = os.path.join(args.save_dir, args.name)
+
+    main(args)

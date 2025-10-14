@@ -1,409 +1,172 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Dec  17:00:00 2023
-
-@author: chun
-"""
 import os
-import torch
-import torch.nn as nn
-from torchvision import transforms
-from torchvision import datasets
-from torch.utils.data import DataLoader
-import torch.optim as optim
-from tqdm import tqdm
-from model import DeepJSCC, ratio2filtersize
-from torch.nn.parallel import DataParallel
-from utils import image_normalization, set_seed, save_model, view_model_param
-from fractions import Fraction
-from dataset import Vanilla, Cifar10Modified
-import numpy as np
-import time
+from xmlrpc.client import Boolean 
+import torch 
 from tensorboardX import SummaryWriter
-import glob
-import time
-from pynvml import *
-
-def train_epoch(model, optimizer, param, data_loader):
-    model.train()
-    epoch_loss = 0
-
-    for iter, (images, _) in enumerate(data_loader):
-        images = images.cuda() if param['parallel'] and torch.cuda.device_count(
-        ) > 1 else images.to(param['device'])
-        optimizer.zero_grad()
-        outputs = model.forward(images)
-        outputs = image_normalization('denormalization')(outputs)
-        images = image_normalization('denormalization')(images)
-        loss = model.loss(images, outputs) if not param['parallel'] else model.module.loss(
-            images, outputs)
-        loss.backward()
-        optimizer.step()
-        batch_loss = loss.detach().item()
-        print(f"[TRAIN] Batch {iter + 1} / {len(data_loader)}: Loss = {batch_loss:.4f}")
-        epoch_loss += batch_loss
-
-    epoch_loss /= (iter + 1)
-
-    return epoch_loss, optimizer
+import torch.optim as optim 
+import torch.optim.lr_scheduler as lr_scheduler
+from torchvision.utils import make_grid
+import re
+import model.DT_JSCC as JSCC_model
+from model.losses import RIBLoss, VAELoss
+from datasets.dataloader import get_data
+from engine import train_one_epoch, test 
+from utils.modulation import QAM, PSK
 
 
-def evaluate_epoch(model, param, data_loader):
-    model.eval()
-    epoch_loss = 0
-
-    with torch.no_grad():
-        for iter, (images, _) in enumerate(data_loader):
-            images = images.cuda() if param['parallel'] and torch.cuda.device_count(
-            ) > 1 else images.to(param['device'])
-            outputs = model.forward(images)
-            outputs = image_normalization('denormalization')(outputs)
-            images = image_normalization('denormalization')(images)
-            loss = model.loss(images, outputs) if not param['parallel'] else model.module.loss(
-                images, outputs)
-            batch_loss = loss.detach().item()
-            epoch_loss += batch_loss
-            # print(f"[VAL] Batch {iter + 1} / {len(data_loader)}: Loss = {batch_loss:.4f}")
-        epoch_loss /= (iter + 1)
-
-    return epoch_loss
+def infer_num_classes(dataset_name: str) -> int:
+    name = dataset_name.upper()
+    if name.startswith("CIFAR100"):
+        return 100
+    if name.startswith("CIFAR10"):
+        return 10
+    if name.startswith("CINIC10"):
+        return 10
+    # fallback: keep user-specified value (or raise)
+    raise ValueError(f"Unknown dataset for inferring num_classes: {dataset_name}")
 
 
 
-def main_pipeline():
-    args = config_parser_pipeline()
+def main(args):
+    ds = str(args.dataset).strip().lower()
 
-    print("Training Start")
-    dataset_name = args.dataset
-    out_dir = args.out
-    args.snr_list = list(map(float, args.snr_list))
-    args.ratio_list = list(map(lambda x: float(Fraction(x)), args.ratio_list))
-    params = {}
-    params['disable_tqdm'] = args.disable_tqdm
-    params['dataset'] = dataset_name
-    params['out_dir'] = out_dir
-    params['device'] = args.device
-    params['snr_list'] = args.snr_list
-    params['ratio_list'] = args.ratio_list
-    params['channel'] = args.channel
-    if dataset_name == 'cifar10' or dataset_name.startswith('cifar10_'):
-        params['batch_size'] = 64  # 1024
-        params['num_workers'] = 4
-        params['epochs'] = 200
-        params['init_lr'] = 1e-3  # 1e-2
-        params['weight_decay'] = 5e-4
-        params['parallel'] = False
-        params['if_scheduler'] = True
-        params['step_size'] = 640
-        params['gamma'] = 0.1
-        params['seed'] = 42
-        params['ReduceLROnPlateau'] = False
-        params['lr_reduce_factor'] = 0.5
-        params['lr_schedule_patience'] = 15
-        params['max_time'] = 12
-        params['min_lr'] = 1e-5
-    elif dataset_name == 'imagenet':
-        params['batch_size'] = 32
-        params['num_workers'] = 4
-        params['epochs'] = 300
-        params['init_lr'] = 1e-4
-        params['weight_decay'] = 5e-4
-        params['parallel'] = True
-        params['if_scheduler'] = True
-        params['gamma'] = 0.1
-        params['seed'] = 42
-        params['ReduceLROnPlateau'] = True
-        params['lr_reduce_factor'] = 0.5
-        params['lr_schedule_patience'] = 15
-        params['max_time'] = 12
-        params['min_lr'] = 1e-5
+    if re.match(r'^cifar100(\b|[_-])', ds):
+        model = JSCC_model.DTJSCC_CIFAR100(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif re.match(r'^cifar10(\b|[_-])', ds):
+        model = JSCC_model.DTJSCC_CIFAR10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif re.match(r'^cinic10(\b|[_-])', ds):
+        model = JSCC_model.DTJSCC_CINIC10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
     else:
-        raise Exception('Unknown dataset')
+        raise ValueError(
+            f"No available model for dataset: {args.dataset}, please check model/DT_JSCC.py."
+        )
 
-    set_seed(params['seed'])
+    model.to(args.device)
+    optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=80,gamma=0.5)    
 
-    for ratio in params['ratio_list']:
-        for snr in params['snr_list']:
-            params['ratio'] = ratio
-            params['snr'] = snr
+    """ Criterion """
+    criterion = RIBLoss(args.lam)
+    criterion.train()
+    
+    """ dataloader """
+    dataloader_train =  get_data(args.dataset, args.N, n_worker= 8)
+    dataloader_vali = get_data(args.dataset, args.N, n_worker= 8, train=False)
+     
+    """ writer """
+    log_writer = SummaryWriter('JSCC/logs/'+ name)
+    
+    # fixed_images, _ = next(iter(dataloader_vali))
+    # fixed_grid = make_grid(fixed_images, nrow=8, range=(-1, 1), normalize=True)
+    # log_writer.add_image('original', fixed_grid, 0)
+    
+    current_epoch = 0
+    best_acc = 0.0
+    """ Some thing wrong here !!"""
+    if os.path.isfile(path_to_backup):
+        checkpoint = torch.load(path_to_backup, map_location='cpu')
+        model.load_state_dict(checkpoint['model_states'])
+        optimizer.load_state_dict(checkpoint['optimizer_states'])
+        current_epoch = checkpoint['epoch']  
+        
+    for epoch in range(current_epoch, args.epoches):
+        channel_args = {}
+        if args.channel == 'rician':
+            channel_args['K'] = getattr(args, 'K', 3)
+        elif args.channel == 'nakagami':
+            channel_args['m'] = getattr(args, 'm', 2)
 
-            train_pipeline(params)
+        if args.mod == 'qam':
+            mod = QAM(args.num_embeddings, args.psnr, args.channel, channel_args)
+        elif args.mod == 'psk':
+            mod = PSK(args.num_embeddings, args.psnr, args.channel, channel_args)
+        else:
+            raise ValueError(f"Unsupported modulation: {args.mod}")
 
-
-# add train_pipeline to with only dataset_name args
-def train_pipeline(params):
-    dataset_name = params['dataset']
-
-    # Load data
-    if dataset_name == 'cifar10':
-        transform = transforms.Compose([transforms.ToTensor(), ])
-        train_dataset = datasets.CIFAR10(root='dataset/', train=True,
-                                         download=True, transform=transform)
-        train_loader = DataLoader(train_dataset, shuffle=True,
-                                  batch_size=params['batch_size'], num_workers=params['num_workers'])
-        test_dataset = datasets.CIFAR10(root='dataset/', train=False,
-                                        download=True, transform=transform)
-        test_loader = DataLoader(test_dataset, shuffle=True,
-                                 batch_size=params['batch_size'], num_workers=params['num_workers'])
-    elif dataset_name.startswith('cifar10_'):
-        transform = transforms.Compose([transforms.ToTensor(), ])
-        train_dataset = Cifar10Modified(dataset_name, transform=transform, train=True)
-        train_loader = DataLoader(train_dataset, shuffle=True,
-                                  batch_size=params['batch_size'], num_workers=params['num_workers'])
-        test_dataset = Cifar10Modified(dataset_name, transform=transform, train=False)
-        test_loader = DataLoader(test_dataset, shuffle=True,
-                                 batch_size=params['batch_size'], num_workers=params['num_workers'])
-    elif dataset_name == 'imagenet':
-        transform = transforms.Compose(
-            [transforms.ToTensor(), transforms.Resize((128, 128))])
-        print("loading data of imagenet")
-        train_dataset = datasets.ImageFolder(root='dataset/ImageNet/train', transform=transform)
-
-        train_loader = DataLoader(train_dataset, shuffle=True,
-                                  batch_size=params['batch_size'], num_workers=params['num_workers'])
-        test_dataset = Vanilla(root='dataset/ImageNet/val', transform=transform)
-        test_loader = DataLoader(test_dataset, shuffle=True,
-                                 batch_size=params['batch_size'], num_workers=params['num_workers'])
-    else:
-        raise Exception('Unknown dataset')
-
-    # Create model
-    image_fisrt = train_dataset.__getitem__(0)[0]
-    c = ratio2filtersize(image_fisrt, params['ratio'])
-    print("The snr is {}, the inner channel is {}, the ratio is {:.2f}".format(
-        params['snr'], c, params['ratio']))
-    model = DeepJSCC(c=c, channel_type=params['channel'], snr=params['snr'])
-
-    # Init experiment directories
-    out_dir = params['out_dir']
-    phaser = dataset_name.upper() + '_' + str(c) + '_' + str(params['snr']) + '_' + \
-        "{:.2f}".format(params['ratio']) + '_' + str(params['channel']) + \
-        '_' + time.strftime('%Hh%Mm%Ss_on_%b_%d_%Y')
-    root_log_dir = out_dir + '/' + 'logs/' + phaser
-    root_ckpt_dir = out_dir + '/' + 'checkpoints/' + phaser
-    root_config_dir = out_dir + '/' + 'configs/' + phaser
-    writer = SummaryWriter(log_dir=root_log_dir)
-
-    # Model init
-    device = torch.device(params['device'] if torch.cuda.is_available() else 'cpu')
-    if params['parallel'] and torch.cuda.device_count() > 1:
-        model = DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
-        model = model.cuda()
-    else:
-        model = model.to(device)
-
-    # Optimizer and scheduler
-    optimizer = optim.Adam(
-        model.parameters(), lr=params['init_lr'], weight_decay=params['weight_decay'])
-    if params['if_scheduler'] and not params['ReduceLROnPlateau']:
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=params['step_size'], gamma=params['gamma'])
-    elif params['ReduceLROnPlateau']:
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
-                                                         factor=params['lr_reduce_factor'],
-                                                         patience=params['lr_schedule_patience'],
-                                                         verbose=False)
-    else:
-        print("No scheduler")
-        scheduler = None
-
-    writer.add_text('config', str(params))
-    t0 = time.time()
-    epoch_train_losses, epoch_val_losses = [], []
-    per_epoch_time = []
-
-    # ---------- GPU power monitoring ----------
-    nvmlInit()
-    handle = nvmlDeviceGetHandleByIndex(0)  # Monitor GPU 0
-    power_samples = []
-    power_sample_interval = 1  # seconds
-    power_last_time = time.time()
-
-    # ---------- Training loop ----------
-    try:
-        with tqdm(range(params['epochs']), disable=params['disable_tqdm']) as t:
-            for epoch in t:
-                t.set_description('Epoch %d' % epoch)
-
-                start = time.time()
-
-                epoch_train_loss, optimizer = train_epoch(
-                    model, optimizer, params, train_loader)
-
-                epoch_val_loss = evaluate_epoch(model, params, test_loader)
-
-                epoch_train_losses.append(epoch_train_loss)
-                epoch_val_losses.append(epoch_val_loss)
-
-                writer.add_scalar('train/_loss', epoch_train_loss, epoch)
-                writer.add_scalar('val/_loss', epoch_val_loss, epoch)
-                writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
-
-                t.set_postfix(time=time.time() - start, lr=optimizer.param_groups[0]['lr'],
-                              train_loss=epoch_train_loss, val_loss=epoch_val_loss)
-
-                per_epoch_time.append(time.time() - start)
-
-                # ---------- GPU power sampling ----------
-                now = time.time()
-                if now - power_last_time >= power_sample_interval:
-                    power = nvmlDeviceGetPowerUsage(handle) / 1000  # mW -> W
-                    power_samples.append(power)
-                    print(f"[GPU] Current Power: {power:.2f} W")
-                    power_last_time = now
-
-                # Save checkpoint
-                if not os.path.exists(root_ckpt_dir):
-                    os.makedirs(root_ckpt_dir)
-                torch.save(model.state_dict(), '{}.pkl'.format(
-                    root_ckpt_dir + "/epoch_" + str(epoch)))
-
-                files = glob.glob(root_ckpt_dir + '/*.pkl')
-                for file in files:
-                    epoch_nb = file.split('_')[-1]
-                    epoch_nb = int(epoch_nb.split('.')[0])
-                    if epoch_nb < epoch - 1:
-                        os.remove(file)
-
-                if params['ReduceLROnPlateau'] and scheduler is not None:
-                    scheduler.step(epoch_val_loss)
-                elif params['if_scheduler'] and not params['ReduceLROnPlateau']:
-                    scheduler.step()
-
-                if optimizer.param_groups[0]['lr'] < params['min_lr']:
-                    print("\n!! LR EQUAL TO MIN LR SET.")
-                    break
-
-                if time.time() - t0 > params['max_time'] * 3600:
-                    print('-' * 89)
-                    print("Max_time for training elapsed {:.2f} hours, so stopping".format(
-                        params['max_time']))
-                    break
-
-    except KeyboardInterrupt:
-        print('-' * 89)
-        print('Exiting from training early because of KeyboardInterrupt')
-
-    # ---------- Shutdown NVML and compute stats ----------
-    nvmlShutdown()
-    total_train_time_hr = (time.time() - t0) / 3600
-    if power_samples:
-        avg_power = sum(power_samples) / len(power_samples)
-        total_energy_Wh = avg_power * total_train_time_hr
-        print(f"\n[GPU] Average Power: {avg_power:.2f} W")
-        print(f"[GPU] Total Energy Consumption: {total_energy_Wh:.2f} Wh")
-    else:
-        print("\n[GPU] No power samples recorded.")
-
-    # ---------- Evaluate and log ----------
-    test_loss = evaluate_epoch(model, params, test_loader)
-    train_loss = evaluate_epoch(model, params, train_loader)
-    print("Test Accuracy: {:.4f}".format(test_loss))
-    print("Train Accuracy: {:.4f}".format(train_loss))
-    print("Convergence Time (Epochs): {:.4f}".format(epoch))
-    print("TOTAL TIME TAKEN: {:.4f}s".format(time.time() - t0))
-    print("AVG TIME PER EPOCH: {:.4f}s".format(np.mean(per_epoch_time)))
-
-    writer.close()
-
-
-
-def train(args, ratio: float, snr: float):  # deprecated
-
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    # load data
-    if args.dataset == 'cifar10':
-        transform = transforms.Compose([transforms.ToTensor(), ])
-        train_dataset = datasets.CIFAR10(root='dataset/', train=True,
-                                         download=True, transform=transform)
-
-        train_loader = DataLoader(train_dataset, shuffle=True,
-                                  batch_size=args.batch_size, num_workers=args.num_workers)
-        test_dataset = datasets.CIFAR10(root='dataset/', train=False,
-                                        download=True, transform=transform)
-        test_loader = DataLoader(test_dataset, shuffle=True,
-                                 batch_size=args.batch_size, num_workers=args.num_workers)
-    elif args.dataset == 'imagenet':
-        transform = transforms.Compose(
-            [transforms.ToTensor(), transforms.Resize((128, 128))])  # the size of paper is 128
-        print("loading data of imagenet")
-        train_dataset = datasets.ImageFolder(root='dataset/ImageNet/train', transform=transform)
-
-        train_loader = DataLoader(train_dataset, shuffle=True,
-                                  batch_size=args.batch_size, num_workers=args.num_workers)
-        test_dataset = Vanilla(root='dataset/ImageNet/val', transform=transform)
-        test_loader = DataLoader(test_dataset, shuffle=True,
-                                 batch_size=args.batch_size, num_workers=args.num_workers)
-    else:
-        raise Exception('Unknown dataset')
-
-    print(args)
-    image_fisrt = train_dataset.__getitem__(0)[0]
-    c = ratio2filtersize(image_fisrt, ratio)
-    print("the inner channel is {}".format(c))
-    model = DeepJSCC(c=c, channel_type=args.channel, snr=snr)
-
-    if args.parallel and torch.cuda.device_count() > 1:
-        model = DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
-        model = model.cuda()
-        criterion = nn.MSELoss(reduction='mean').cuda()
-    else:
-        model = model.to(device)
-        criterion = nn.MSELoss(reduction='mean').to(device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    if args.if_scheduler:
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
-
-    epoch_loop = tqdm(range(args.epochs), total=args.epochs, leave=True, disable=args.disable_tqdm)
-    for epoch in epoch_loop:
-        run_loss = 0.0
-        for images, _ in tqdm((train_loader), leave=False, disable=args.disable_tqdm):
-            optimizer.zero_grad()
-            images = images.cuda() if args.parallel and torch.cuda.device_count() > 1 else images.to(device)
-            outputs = model(images)
-            outputs = image_normalization('denormalization')(outputs)
-            images = image_normalization('denormalization')(images)
-            loss = criterion(outputs, images)
-            loss.backward()
-            optimizer.step()
-            run_loss += loss.item()
-        if args.if_scheduler:  # the scheduler is wrong before
-            scheduler.step()
-        with torch.no_grad():
-            model.eval()
-            test_mse = 0.0
-            for images, _ in tqdm((test_loader), leave=False, disable=args.disable_tqdm):
-                images = images.cuda() if args.parallel and torch.cuda.device_count() > 1 else images.to(device)
-                outputs = model(images)
-                images = image_normalization('denormalization')(images)
-                outputs = image_normalization('denormalization')(outputs)
-                loss = criterion(outputs, images)
-                test_mse += loss.item()
-            model.train()
-        # epoch_loop.set_postfix(loss=run_loss/len(train_loader), test_mse=test_mse/len(test_loader))
-        print("epoch: {}, loss: {:.4f}, test_mse: {:.4f}, lr:{}".format(
-            epoch, run_loss / len(train_loader), test_mse / len(test_loader), optimizer.param_groups[0]['lr']))
-    save_model(model, args.saved, args.saved + '/{}_{}_{:.2f}_{:.2f}_{}_{}.pth'
-               .format(args.dataset, args.epochs, ratio, snr, args.batch_size, c))
-
-
-def config_parser_pipeline():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', default='cifar10', type=str,
-                        choices=['cifar10', 'imagenet'], help='dataset')
-    parser.add_argument('--out', default='JSCC/out', type=str, help='out_path')
-    parser.add_argument('--disable_tqdm', default=False, type=bool, help='disable_tqdm')
-    parser.add_argument('--device', default='cuda:0', type=str, help='device')
-    parser.add_argument('--parallel', default=False, type=bool, help='parallel')
-    parser.add_argument('--snr_list', default=['7'], nargs='+', help='snr_list')
-    parser.add_argument('--ratio_list', default=['1/6'], nargs='+', help='ratio_list')
-    parser.add_argument('--channel', default='AWGN', type=str,
-                        choices=['AWGN', 'Rayleigh', 'Rician', 'Nakagami'], help='channel')
-
-    return parser.parse_args()
+        train_one_epoch(dataloader_train, model, optimizer=optimizer, criterion=criterion,
+                            writer=log_writer, epoch=epoch, mod=mod, args=args)
+        scheduler.step()
+        if (epoch >100): 
+            acc1 = test(dataloader_vali, model, criterion=criterion, writer=log_writer, epoch=epoch, mod=mod, args=args)
+        
+            print('Epoch ', epoch)
+            print('Best accuracy: ', best_acc)
+        
+            if (epoch == 0) or (acc1 > best_acc):
+                best_acc = acc1
+                with open('{0}/best.pt'.format(path_to_backup), 'wb') as f:
+                    torch.save(
+                    {
+                    'epoch': epoch, 
+                    'model_states': model.state_dict(), 
+                    'optimizer_states': optimizer.state_dict(),
+                    }, f
+                )
+        with open('{0}/model_{1}.pt'.format(path_to_backup, epoch + 1), 'wb') as f:
+            torch.save(
+            {
+                'epoch': epoch, 
+                'model_states': model.state_dict(), 
+                'optimizer_states': optimizer.state_dict(),
+            }, f 
+        )
+            
 
 
 if __name__ == '__main__':
-    main_pipeline()
+    import argparse
+    import os
+    import multiprocessing as mp
 
+    parser = argparse.ArgumentParser(description='VDL')
+    
+    parser.add_argument('-d', '--dataset', type=str, default='CINIC10', help='dataset name')
+    parser.add_argument('-r', '--root', type=str, default='JSCC/trained_models', help='The root of trained models')
+    parser.add_argument('--device', type=str, default='cuda:0', help= 'The device')
+    
+    parser.add_argument('--mod', type=str, default='psk', help='The modulation')
+
+    parser.add_argument('--num_latent', type=int, default=4, help='The number of latent variable')
+    parser.add_argument('--latent_d', type=int, default=512, help='The dimension of latent vector')
+    parser.add_argument('--in_channels', type=int, default=3, help='The image input channel')
+    
+    parser.add_argument('-e', '--epoches', type=int, default=150, help='Number of epoches')
+    parser.add_argument('--N', type=int, default=512, help='The batch size of training data')
+    parser.add_argument('--lr', type=float, default=1e-3, help='learn rate')
+    parser.add_argument('--maxnorm', type=float, default=1., help='The max norm of flip')
+    
+    parser.add_argument('--num_embeddings', type=int, default=16, help='The size of codebook')
+
+    parser.add_argument('--lam', type=float, default=0.0, help='The lambda' )
+    parser.add_argument('--psnr', type=float, default=8.0, help='The psnr' )
+
+    parser.add_argument('--num_workers', type=int, default=0,
+        help='number of workers for trajectories sampling (default: {0})'.format(mp.cpu_count() - 1))
+
+    parser.add_argument('--channel', type=str, default='awgn',
+                        choices=['awgn', 'rayleigh', 'rician', 'nakagami'],
+                        help='Channel type: awgn, rayleigh, rician, nakagami')
+
+    args = parser.parse_args()
+    args.num_classes = infer_num_classes(args.dataset)
+    args.n_iter = 0
+    name = args.dataset + '-'+ str(args.channel)
+ 
+    path_to_backup = os.path.join(args.root, name)
+    if not os.path.exists(path_to_backup):
+        print('Making ', path_to_backup, '...')
+        os.makedirs(path_to_backup)
+
+
+    device = torch.device(args.device if(torch.cuda.is_available()) else "cpu")
+    print('Device: ', device)
+
+    main(args)

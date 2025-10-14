@@ -1,174 +1,208 @@
-# retrain.py
 import os
+import re
+from xmlrpc.client import Boolean  # (kept as in original; appears unused)
 import torch
-import time
-from fractions import Fraction
-from model import DeepJSCC, ratio2filtersize
-from utils import set_seed, image_normalization, view_model_param
-from dataset import Cifar10Modified, Vanilla
-from torch.nn.parallel import DataParallel
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-import torch.optim as optim
-from tqdm import tqdm
 from tensorboardX import SummaryWriter
-import numpy as np
-import glob
-import yaml
-from collections import OrderedDict
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+from torchvision.utils import make_grid
 
-def train_epoch(model, optimizer, param, data_loader):
-    model.train()
-    epoch_loss = 0
-    for iter, (images, _) in enumerate(data_loader):
-        images = images.cuda() if param['parallel'] and torch.cuda.device_count() > 1 else images.to(param['device'])
-        optimizer.zero_grad()
-        outputs = model.forward(images)
-        outputs = image_normalization('denormalization')(outputs)
-        images = image_normalization('denormalization')(images)
-        loss = model.loss(images, outputs) if not param['parallel'] else model.module.loss(images, outputs)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.detach().item()
-    return epoch_loss / (iter + 1), optimizer
+import model.DT_JSCC as JSCC_model
+from model.losses import RIBLoss
+from datasets.dataloader import get_data
+from engine import train_one_epoch, test
+from utils.modulation import QAM, PSK
+import time
 
-def evaluate_epoch(model, param, data_loader):
-    model.eval()
-    epoch_loss = 0
-    with torch.no_grad():
-        for iter, (images, _) in enumerate(data_loader):
-            images = images.cuda() if param['parallel'] and torch.cuda.device_count() > 1 else images.to(param['device'])
-            outputs = model.forward(images)
-            outputs = image_normalization('denormalization')(outputs)
-            images = image_normalization('denormalization')(images)
-            loss = model.loss(images, outputs) if not param['parallel'] else model.module.loss(images, outputs)
-            epoch_loss += loss.detach().item()
-    return epoch_loss / (iter + 1)
+# ----------------------------- regex helpers ------------------------------ #
+# Match dataset base at the beginning: cifar100 / cifar10 / cinic10,
+# followed by a word boundary, underscore, hyphen, or end of string.
+_DATASET_BASE_RE = re.compile(r'^(cifar100|cifar10|cinic10)(?=\b|[_-]|$)', flags=re.IGNORECASE)
 
-def retrain():
-    # === Set parameters manually ===
-    resume_path = 'checkpoints/CIFAR10_8_7.0_0.17_Rayleigh_w_noise_RETRAIN_w_Rician_20h52m50s_on_Jul_01_2025/epoch_499.pkl'
-    dataset_name = 'cifar10'
-    snr = 7.0
-    ratio = float(Fraction('1/6'))
-    device = 'cuda:0'
+def detect_base(dataset_name: str) -> str:
+    """Return canonical base in UPPER (CIFAR10 / CIFAR100 / CINIC10) via regex."""
+    ds = str(dataset_name).strip()
+    m = _DATASET_BASE_RE.match(ds)
+    if not m:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    return m.group(1).upper()
 
-    params = {
-        'dataset': dataset_name,
-        'out_dir': 'JSCC/out',
-        'device': device,
-        'parallel': False,
-        'snr': snr,
-        'ratio': ratio,
-        'channel': 'AWGN',
-        'disable_tqdm': False,
-        'resume': resume_path,
-        'seed': 42,
-        'batch_size': 64,
-        'num_workers': 4,
-        'epochs': 500,
-        'init_lr': 1e-3,
-        'weight_decay': 5e-4,
-        'if_scheduler': True,
-        'step_size': 640,
-        'gamma': 0.1,
-        'ReduceLROnPlateau': False,
-        'lr_reduce_factor': 0.5,
-        'lr_schedule_patience': 15,
-        'max_time': 12,
-        'min_lr': 1e-5,
-    }
+def infer_num_classes(dataset_name: str) -> int:
+    """Infer number of classes based on regex-detected base."""
+    base = detect_base(dataset_name)
+    if base == "CIFAR100":
+        return 100
+    if base in ("CIFAR10", "CINIC10"):
+        return 10
+    # Unreachable due to detect_base guard
+    raise ValueError(f"Unknown dataset for inferring num_classes: {dataset_name}")
 
-    set_seed(params['seed'])
 
-    # === Load data ===
-    transform = transforms.Compose([transforms.ToTensor()])
-    train_dataset = datasets.CIFAR10(root='dataset/', train=True, download=True, transform=transform)
-    test_dataset = datasets.CIFAR10(root='dataset/', train=False, download=True, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=params['batch_size'], shuffle=True, num_workers=params['num_workers'])
-    test_loader = DataLoader(test_dataset, batch_size=params['batch_size'], shuffle=False, num_workers=params['num_workers'])
+def main(args):
+    # ---------------- Model and Optimizer ---------------- #
+    base = detect_base(args.dataset)  # "CIFAR10" / "CIFAR100" / "CINIC10"
 
-    image_first = train_dataset[0][0]
-    c = ratio2filtersize(image_first, params['ratio'])
-
-    print("[Retrain] Dataset: {}, SNR: {}, Channel: {}, Ratio: {:.2f}, C: {}".format(params['dataset'], params['snr'], params['channel'], params['ratio'], c))
-
-    # === Build model ===
-    model = DeepJSCC(c=c, channel_type=params['channel'], snr=params['snr'])
-    device = torch.device(params['device'] if torch.cuda.is_available() else 'cpu')
-
-    if 'resume' in params and os.path.exists(params['resume']):
-        print(f"Loading pretrained weights from {params['resume']}")
-        state_dict = torch.load(params['resume'], map_location=device)
-        if any(k.startswith('module.') for k in state_dict.keys()):
-            new_state_dict = OrderedDict((k.replace('module.', ''), v) for k, v in state_dict.items())
-            state_dict = new_state_dict
-        model.load_state_dict(state_dict)
-
-    if params['parallel'] and torch.cuda.device_count() > 1:
-        model = DataParallel(model, device_ids=list(range(torch.cuda.device_count())))
-        model = model.cuda()
+    # Select model by regex base (supports dataset variants like CIFAR10_noise)
+    if base == 'CINIC10':
+        model = JSCC_model.DTJSCC_CINIC10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif base == 'CIFAR10':
+        model = JSCC_model.DTJSCC_CIFAR10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif base == 'CIFAR100':
+        model = JSCC_model.DTJSCC_CIFAR100(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
     else:
-        model = model.to(device)
+        # Should not happen due to detect_base guard
+        raise ValueError(f"No available model for dataset: {args.dataset}, please check model/DT_JSCC.py.")
 
-    # === Setup optimizer ===
-    optimizer = optim.Adam(model.parameters(), lr=params['init_lr'], weight_decay=params['weight_decay'])
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=params['step_size'], gamma=params['gamma']) if params['if_scheduler'] else None
+    model.to(args.device)
 
-    # === Setup logging ===
-    timestamp = time.strftime('%Hh%Mm%Ss_on_%b_%d_%Y')
-    phase = f"{dataset_name.upper()}_{c}_{params['snr']}_{params['ratio']:.2f}_{params['channel']}_RETRAIN"
-    root_log_dir = os.path.join(params['out_dir'], 'logs', phase)
-    root_ckpt_dir = os.path.join(params['out_dir'], 'checkpoints', phase)
-    root_config_dir = os.path.join(params['out_dir'], 'configs', phase)
-    os.makedirs(root_ckpt_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=root_log_dir)
+    optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=80, gamma=0.5)
 
-    t0 = time.time()
-    per_epoch_time = []
+    # ---------------- Criterion ---------------- #
+    criterion = RIBLoss(args.lam)
+    criterion.train()
 
-    try:
-        for epoch in tqdm(range(params['epochs']), disable=params['disable_tqdm']):
-            start = time.time()
-            train_loss, optimizer = train_epoch(model, optimizer, params, train_loader)
-            val_loss = evaluate_epoch(model, params, test_loader)
+    # ---------------- Dataloaders ---------------- #
+    # Keep using the original args.dataset string (may include suffix), so that
+    # get_data can route to the corresponding variant.
+    dataloader_train = get_data(args.dataset, args.N, n_worker=8)
+    dataloader_vali  = get_data(args.dataset, args.N, n_worker=8, train=False)
 
-            writer.add_scalar('train/_loss', train_loss, epoch)
-            writer.add_scalar('val/_loss', val_loss, epoch)
-            writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+    # ---------------- Writer ---------------- #
+    # Reuse external 'name' variable as in the original script.
+    log_writer = SummaryWriter('RT-JSCC/logs/' + name)
 
-            per_epoch_time.append(time.time() - start)
-            print(f"[Epoch {epoch}] Train: {train_loss:.4f}, Val: {val_loss:.4f}, Time: {per_epoch_time[-1]:.2f}s")
+    current_epoch = 0
+    best_acc = 0.0
 
-            # Save checkpoint every 10 epochs
-            if epoch % 100 == 0 or epoch == params['epochs'] - 1:
-                ckpt_path = os.path.join(root_ckpt_dir, f'epoch_{epoch}.pkl')
-                torch.save(model.state_dict(), ckpt_path)
+    # ---------------- Resume from checkpoint (optional) ---------------- #
+    if os.path.isfile(path_to_checkpoint):
+        checkpoint = torch.load(path_to_checkpoint, map_location='cpu')
+        model.load_state_dict(checkpoint['model_states'])
+        optimizer.load_state_dict(checkpoint['optimizer_states'])
+        best_acc = checkpoint.get('best_acc', 0.0)
+        print(f"[Checkpoint] Loaded from {path_to_checkpoint}, reset epoch to 0 for retraining.")
 
-            # Learning rate step
-            if scheduler:
-                scheduler.step()
+    # ---------------- Training loop ---------------- #
+    for epoch in range(args.epoches):
+        # Build channel args per selected channel
+        channel_args = {}
+        if args.channel == 'rician':
+            channel_args['K'] = getattr(args, 'K', 3)
+        elif args.channel == 'nakagami':
+            channel_args['m'] = getattr(args, 'm', 2)
 
-            if optimizer.param_groups[0]['lr'] < params['min_lr']:
-                print("!! Reached min LR. Stopping.")
-                break
+        # Modulator selection
+        if args.mod == 'qam':
+            mod = QAM(args.num_embeddings, args.psnr, args.channel, channel_args)
+        elif args.mod == 'psk':
+            mod = PSK(args.num_embeddings, args.psnr, args.channel, channel_args)
+        else:
+            raise ValueError(f"Unsupported modulation: {args.mod}")
 
-            if time.time() - t0 > params['max_time'] * 3600:
-                print(f"!! Reached max training time ({params['max_time']} hours). Stopping.")
-                break
+        # Train one epoch
+        train_one_epoch(
+            dataloader_train, model, optimizer=optimizer, criterion=criterion,
+            writer=log_writer, epoch=epoch, mod=mod, args=args
+        )
+        scheduler.step()
 
-    except KeyboardInterrupt:
-        print("Training interrupted manually.")
+        # Validate after 100 epochs (as in original)
+        if epoch > 100:
+            acc1 = test(
+                dataloader_vali, model, criterion=criterion, writer=log_writer,
+                epoch=epoch, mod=mod, args=args
+            )
 
-    test_loss = evaluate_epoch(model, params, test_loader)
-    print(f"Final Test Loss: {test_loss:.4f}")
+            print('Epoch', epoch)
+            print('Best accuracy:', best_acc)
 
-    writer.add_text('result', f"Final Test Loss: {test_loss:.4f}\nAvg Epoch Time: {np.mean(per_epoch_time):.2f}s")
-    writer.close()
+            if acc1 > best_acc:
+                best_acc = acc1
+                with open(os.path.join(path_to_save, 'best.pt'), 'wb') as f:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_states': model.state_dict(),
+                        'optimizer_states': optimizer.state_dict(),
+                        'best_acc': best_acc,
+                    }, f)
 
-    os.makedirs(os.path.dirname(root_config_dir), exist_ok=True)
-    with open(root_config_dir + '.yaml', 'w') as f:
-        yaml.dump({'params': params, 'inner_channel': c, 'total_parameters': view_model_param(model)}, f)
+        # Always save epoch checkpoints
+        with open(os.path.join(path_to_save, f'model_{epoch}.pt'), 'wb') as f:
+            torch.save({
+                'epoch': epoch,
+                'model_states': model.state_dict(),
+                'optimizer_states': optimizer.state_dict(),
+                'best_acc': best_acc,
+            }, f)
+
 
 if __name__ == '__main__':
-    retrain()
+    import argparse
+    import multiprocessing as mp
+    start_time = time.time()
+    print('Number of workers (default: {0})'.format(mp.cpu_count() - 1))
+
+    parser = argparse.ArgumentParser(description='Retrain JSCC')
+
+    parser.add_argument('-d', '--dataset', type=str, default='CIFAR100', help='Dataset name')
+    parser.add_argument('--device', type=str, default='cuda:0', help='Device')
+
+    parser.add_argument('--mod', type=str, default='psk', help='Modulation type')
+    parser.add_argument('--channel', type=str, default='rician',
+                        choices=['awgn', 'rayleigh', 'rician', 'nakagami'], help='Channel type')
+    parser.add_argument('--K', type=float, default=3.0, help='Rician K-factor')
+    parser.add_argument('--m', type=float, default=2.0, help='Nakagami m-parameter')
+
+    parser.add_argument('--num_latent', type=int, default=4, help='Number of latent variables')
+    parser.add_argument('--latent_d', type=int, default=512, help='Latent vector dimension')
+    parser.add_argument('--in_channels', type=int, default=3, help='The image input channel')
+
+    parser.add_argument('--epoches', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--N', type=int, default=512, help='Batch size')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
+    parser.add_argument('--maxnorm', type=float, default=1., help='Max norm')
+    parser.add_argument('--num_embeddings', type=int, default=16, help='Codebook size')
+    parser.add_argument('--lam', type=float, default=0.0, help='Lambda')
+    parser.add_argument('--psnr', type=float, default=8.0, help='PSNR value')
+
+    parser.add_argument('--num_workers', type=int, default=mp.cpu_count() - 1, help='Number of data loader workers')
+
+    args = parser.parse_args()
+    args.n_iter = 0
+
+    # Build a run name; keep original pattern but works with dataset variants
+
+
+    # You can still override these manually if desired; here we keep the original defaults.
+    # Derive a reasonable default checkpoint path using the regex base if needed.
+    base_upper = detect_base(args.dataset)       # "CIFAR10" / "CIFAR100" / "CINIC10"
+    name = f"{base_upper}-rt-{args.dataset}-{args.channel}"
+    # Example: use base 'awgn' best as init (matches original intent)
+    # path_to_checkpoint = os.path.join('RT-JSCC/retrained_models/CIFAR10_noise-awgn-rt-CIFAR10_noise-rician', 'model_49.pt')
+    path_to_checkpoint = os.path.join('JSCC/trained_models', f'{base_upper}-awgn', 'best.pt')
+
+    path_to_save = os.path.join('RT-JSCC/retrained_models', name)
+    if not os.path.exists(path_to_save):
+        print(f'Making {path_to_save}...')
+        os.makedirs(path_to_save)
+
+    args.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print('Device:', args.device)
+
+    # Regex-based class inference
+    args.num_classes = infer_num_classes(args.dataset)
+
+    main(args)
+    end_time = time.time()
+    duration = end_time - start_time
+    print(f"[Time] Total retraining time: {duration:.2f} seconds")

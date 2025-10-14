@@ -1,175 +1,272 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms
-from model import DeepJSCC, ratio2filtersize
-from utils import image_normalization, get_psnr
-from dataset import Cifar10Modified
-import higher
+# meta_train.py
 import os
-import time
-import numpy as np
-from channel import Channel
-from copy import deepcopy
-import yaml
+import re
+import torch
+import torch.nn.functional as F
+from tensorboardX import SummaryWriter
+import higher
 
-# -----------------------------------------------------------------------
-# Recommended Hyperparameters to Start
-# -----------------------------------------------------------------------
-# Meta-Learning Hyperparameters
-META_EPOCHS = 100  # Train for longer to see a clear trend
-INNER_STEPS = 5  # Number of inner loop adaptation steps (now means 5 batches total)
-META_BATCH_SIZE = 4  # Use all tasks for a stable meta-gradient
-INNER_LR = 1e-7  # Inner loop learning rate for Adam
-META_LR = 1e-5  # A stable starting point for the meta-learning rate
+from datasets.dataloader import get_data
+import model.DT_JSCC as JSCC_model
+from utils.modulation import QAM, PSK
 
-# General Training Hyperparameters
-BATCH_SIZE = 32
-RATIO = 1 / 6
+# ----------------------------- regex helpers ------------------------------ #
+# Match base at the beginning: cifar100 / cifar10 / cinic10,
+# followed by a word boundary, underscore, hyphen, or end of string.
+_DATASET_BASE_RE = re.compile(r'^(cifar100|cifar10|cinic10)(?=\b|[_-]|$)', flags=re.IGNORECASE)
 
+def detect_base(dataset_name: str) -> str:
+    """Return canonical base in UPPER (CIFAR10 / CIFAR100 / CINIC10) via regex."""
+    ds = str(dataset_name).strip()
+    m = _DATASET_BASE_RE.match(ds)
+    if not m:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    return m.group(1).upper()
 
-# -----------------------------------------------------------------------
-# CORRECTED MAML Training Function
-# -----------------------------------------------------------------------
-def maml_train(args):
-    """
-    Main function for MAML training with a corrected "few-shot" inner loop.
-    """
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+def infer_num_classes(dataset_name: str) -> int:
+    """Infer number of classes based on regex-detected base."""
+    base = detect_base(dataset_name)
+    if base == "CIFAR100":
+        return 100
+    if base in ("CIFAR10", "CINIC10"):
+        return 10
+    # Unreachable due to detect_base guard
+    raise ValueError(f"Unknown dataset for inferring num_classes: {dataset_name}")
 
-    transform = transforms.Compose([transforms.ToTensor()])
-    full_dataset = datasets.CIFAR10(root='dataset/', train=True, download=True, transform=transform)
-    image_first = full_dataset[0][0]
-    c = ratio2filtersize(image_first, RATIO)
+# ---------- utility functions ----------
+def freeze_running_stats(model):
+    """Freeze running_mean and running_var of every BatchNorm layer."""
+    for m in model.modules():
+        if isinstance(m, torch.nn.BatchNorm2d):
+            m.eval()
+            # Uncomment if you also want to freeze BN affine params:
+            # m.weight.requires_grad_(False)
+            # m.bias.requires_grad_(False)
 
-    meta_model = DeepJSCC(c=c).to(device)
-    # Use Adam for the meta-optimizer as it's generally robust.
-    meta_optimizer = optim.SGD(meta_model.parameters(), lr=META_LR)
-    criterion = nn.MSELoss()
+def bn_to_gn(model, num_groups=8):
+    """Recursively replace BatchNorm2d with GroupNorm."""
+    import torch.nn as nn
+    for name, child in model.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            gn = nn.GroupNorm(
+                num_groups=min(num_groups, child.num_features),
+                num_channels=child.num_features,
+            )
+            setattr(model, name, gn)
+        else:
+            bn_to_gn(child, num_groups)
 
-    t0 = time.time()
-    per_epoch_time = []
+# ---------- meta-training ----------
+def meta_train(args):
+    writer = SummaryWriter(log_dir=os.path.join("Meta-JSCC/logs", args.name))
+    best_meta_loss = float("inf")
 
-    # --- Start of the Meta-Training Outer Loop ---
-    for meta_epoch in range(META_EPOCHS):
-        # We deepcopy the model at the start of the epoch for a clean reference
-        # This is not strictly necessary but can help if you add more complex logic later
-        meta_model_epoch_start = deepcopy(meta_model)
+    # Task list (use regex-detected base)
+    base = detect_base(args.dataset)  # "CIFAR10" / "CIFAR100" / "CINIC10"
+    tasks = [
+        (base, "awgn"),
+        (f"{base}_noise", "awgn"),
+        (base, "rician"),
+    ]
 
-        sampled_tasks = [TASKS[i] for i in torch.randperm(len(TASKS))[:META_BATCH_SIZE]]
-        meta_losses = []
+    # Build base model (by regex base)
+    if base == 'CINIC10':
+        base_model = JSCC_model.DTJSCC_CINIC10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif base == 'CIFAR10':
+        base_model = JSCC_model.DTJSCC_CIFAR10(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    elif base == 'CIFAR100':
+        base_model = JSCC_model.DTJSCC_CIFAR100(
+            args.in_channels, args.latent_d, args.num_classes,
+            num_embeddings=args.num_embeddings
+        )
+    else:
+        # Should not happen due to detect_base guard
+        raise ValueError(f"No available model for dataset: {args.dataset}, please check model/DT_JSCC.py.")
 
-        print(f"[Meta Epoch {meta_epoch + 1}/{META_EPOCHS}]")
+    base_model.train()
+    base_model.to(args.device)
 
-        # --- Loop over the sampled tasks ---
-        for task_id, task in enumerate(sampled_tasks):
-            dataset_name = task['dataset']
-            channel_type = task['channel']
-            snr = task['snr']
+    # Load a supervised pre-training checkpoint if provided
+    if args.init is not None and os.path.isfile(args.init):
+        ckpt = torch.load(args.init, map_location="cpu")
+        base_model.load_state_dict(ckpt["model_states"] if "model_states" in ckpt else ckpt)
+        print(f"==> Loaded checkpoint from {args.init}")
 
-            print(f"  Task {task_id + 1}: Dataset={dataset_name}, Channel={channel_type}, SNR={snr}")
+    # Optional: replace BN with GN
+    if args.use_gn:
+        bn_to_gn(base_model, num_groups=8)
+        base_model.to(args.device)
+        print("==> Replaced all BatchNorm with GroupNorm")
 
-            # === Dataset Loading for the current task ===
-            # (Your data loading code here remains unchanged)
-            # ...
-            train_len = int(0.5 * len(full_dataset))
-            val_len = len(full_dataset) - train_len
-            train_set, val_set = random_split(full_dataset, [train_len, val_len])
-            train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=args.num_workers)
-            val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=args.num_workers)
-            # ...
+    # Optional: freeze running stats of BN
+    if args.freeze_bn:
+        freeze_running_stats(base_model)
+        print("==> Frozen BatchNorm running stats")
 
-            task_channel = Channel(channel_type, snr=snr).to(device)
+    # Outer optimizer
+    meta_optimizer = torch.optim.AdamW(base_model.parameters(), lr=args.meta_lr, weight_decay=1e-4)
 
-            # Create a temporary task model for the inner loop.
-            # We use the clean model from the start of the epoch.
-            task_model = deepcopy(meta_model_epoch_start)
-            inner_optimizer = optim.Adam(task_model.parameters(), lr=INNER_LR)
-
-            # Use FOMAML (track_higher_grads=False) for stability.
-            with higher.innerloop_ctx(task_model, inner_optimizer, track_higher_grads=False) as (fmodel, diffopt):
-
-                # --- CRITICAL FIX: Correct "Few-Shot" Inner Loop ---
-                train_loader_iter = iter(train_loader)
-
-                # The inner loop now runs for exactly INNER_STEPS gradient updates.
-                for step in range(INNER_STEPS):
-                    try:
-                        # Get ONE batch of data for this ONE adaptation step.
-                        images, _ = next(train_loader_iter)
-                    except StopIteration:
-                        # Reset the iterator if the dataloader is exhausted
-                        train_loader_iter = iter(train_loader)
-                        images, _ = next(train_loader_iter)
-
-                    images = images.to(device)
-
-                    # Perform one adaptation step
-                    outputs = fmodel(images, channel=task_channel)
-                    outputs = image_normalization('denormalization')(outputs)
-                    images = image_normalization('denormalization')(images)
-                    loss = criterion(outputs, images)
-                    diffopt.step(loss)
-
-                    print(f"    Inner Step {step + 1}/{INNER_STEPS}, Loss: {loss.item():.4f}")
-
-                # --- Validation ---
-                fmodel.eval()
-                val_images, _ = next(iter(val_loader))
-                val_images = val_images.to(device)
-
-                val_outputs = fmodel(val_images, channel=task_channel)
-                val_outputs = image_normalization('denormalization')(val_outputs)
-                val_images = image_normalization('denormalization')(val_images)
-
-                val_loss = criterion(val_outputs, val_images)
-                val_psnr = get_psnr(image=None, gt=None, mse=val_loss.item())
-
-                print(f"    Validation Loss: {val_loss.item():.4f}")
-                print(f"    Validation PSNR: {val_psnr:.2f} dB")
-                meta_losses.append(val_loss)
-
-        # --- Meta-Update ---
-        meta_loss = torch.stack(meta_losses).mean()
-
-        # We perform the backward pass on the original meta_model
-        # The gradient calculation will be based on the difference between
-        # the adapted models and the original meta_model.
+    # Meta-training loop
+    for meta_iter in range(args.meta_iters):
         meta_optimizer.zero_grad()
-        meta_loss.backward()
+        total_meta_loss = 0.0
+        print(f"\n=== Meta Iteration {meta_iter} ===")
 
-        # Optional: Gradient Clipping for stability
-        torch.nn.utils.clip_grad_norm_(meta_model.parameters(), max_norm=1.0)
+        for task_idx, (dataset_name, channel_type) in enumerate(tasks):
+            print(f"\n-- Task {task_idx + 1}/{len(tasks)}: Dataset={dataset_name}, Channel={channel_type}")
 
+            # Build modulator (kept on CPU)
+            channel_args = {}
+            if channel_type == "rician":
+                channel_args["K"] = args.K
+            elif channel_type == "nakagami":
+                channel_args["m"] = args.m
+            mod = QAM(args.num_embeddings, args.psnr, channel_type, channel_args) \
+                  if args.mod == "qam" else \
+                  PSK(args.num_embeddings, args.psnr, channel_type, channel_args)
+
+            # Dataloaders
+            support_loader = get_data(dataset_name, args.inner_bs, n_worker=4)
+            query_loader = get_data(dataset_name, args.query_bs, n_worker=4, train=False)
+
+            # Inner optimizer
+            inner_opt = torch.optim.SGD(base_model.parameters(), lr=args.inner_lr, momentum=0.9)
+
+            # First-order MAML (track_higher_grads=False)
+            with higher.innerloop_ctx(
+                base_model,
+                inner_opt,
+                copy_initial_weights=True,
+                track_higher_grads=False,
+            ) as (fmodel, diffopt):
+
+                fmodel.train()
+                support_iter = iter(support_loader)
+
+                # ---------- inner loop ----------
+                for _ in range(args.inner_steps):
+                    try:
+                        imgs, lbls = next(support_iter)
+                    except StopIteration:
+                        support_iter = iter(support_loader)
+                        imgs, lbls = next(support_iter)
+
+                    imgs, lbls = imgs.to(args.device), lbls.to(args.device)
+                    logits, _ = fmodel(imgs, mod=mod)
+                    loss_s = F.cross_entropy(logits, lbls)
+                    diffopt.step(loss_s)
+
+                # ---------- meta (query) ----------
+                fmodel.eval()
+                query_iter = iter(query_loader)
+                meta_loss, meta_acc = 0.0, 0.0
+
+                for _ in range(args.query_steps):
+                    try:
+                        q_imgs, q_lbls = next(query_iter)
+                    except StopIteration:
+                        query_iter = iter(query_loader)
+                        q_imgs, q_lbls = next(query_iter)
+
+                    q_imgs, q_lbls = q_imgs.to(args.device), q_lbls.to(args.device)
+                    q_logits, _ = fmodel(q_imgs, mod=mod)
+                    loss_q = F.cross_entropy(q_logits, q_lbls)
+                    meta_loss += loss_q
+
+                    pred = torch.argmax(q_logits, dim=1)
+                    meta_acc += (pred == q_lbls).float().mean().item()
+
+                meta_loss /= args.query_steps
+                meta_acc /= args.query_steps
+                print(f"[Meta loss] {meta_loss.item():.4f}, Acc: {meta_acc*100:.2f}%")
+
+                meta_loss.backward()
+                total_meta_loss += meta_loss.item()
+
+        # Update outer parameters
         meta_optimizer.step()
+        if meta_iter == 0:
+            ema_loss = total_meta_loss
+        else:
+            ema_loss = 0.2 * total_meta_loss + 0.8 * ema_loss
+        writer.add_scalar("meta_loss", total_meta_loss, meta_iter)
+        writer.add_scalar("ema_meta_loss", ema_loss, meta_iter)
 
-        per_epoch_time.append(time.time() - t0)
-        print(f"  Meta Loss: {meta_loss.item():.4f}\n")
+        print(f"[MetaIter {meta_iter}] Total Loss={total_meta_loss:.4f}, EMA={ema_loss:.4f}")
 
-    # --- End of Training ---
-    # (Your end-of-training code for saving models etc. remains unchanged)
-    # ...
+        # ---------- save checkpoints ----------
+        base_lower = detect_base(args.dataset).lower()
+        ckpt = {"model_states": base_model.state_dict(),
+                "meta_iter": meta_iter,
+                "meta_loss": total_meta_loss}
 
+        # Always keep last
+        torch.save(ckpt, os.path.join(args.save_path, f"{base_lower}_meta_last.pt"))
 
+        # Save best by meta-loss
+        if total_meta_loss < best_meta_loss:
+            best_meta_loss = total_meta_loss
+            torch.save(ckpt, os.path.join(args.save_path, f"{base_lower}_meta_best.pt"))
+            print(f"Saved new best model (loss {best_meta_loss:.4f})")
+
+# ---------- CLI ----------
 if __name__ == "__main__":
     import argparse
 
-    # Creating a simple args object for demonstration
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='cifar10')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--saved', type=str, default='Meta-JSCC/out/checkpoints')
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument('-d', '--dataset', type=str, default='CINIC10', help='dataset name')
+    # model hyper-parameters
+    parser.add_argument("--in_channels", type=int, default=3)
+    parser.add_argument("--latent_d", type=int, default=512)
+    parser.add_argument("--num_embeddings", type=int, default=16)
+
+    # channel / modulation
+    parser.add_argument("--psnr", type=float, default=8.0)
+    parser.add_argument("--mod", type=str, choices=["qam", "psk"], default="psk")
+    parser.add_argument("--K", type=float, default=3.0)
+    parser.add_argument("--m", type=float, default=2.0)
+
+    # meta / inner-loop hyper-parameters
+    parser.add_argument("--meta_iters", type=int, default=100)
+    parser.add_argument("--inner_steps", type=int, default=10)
+    parser.add_argument("--query_steps", type=int, default=4)
+    parser.add_argument("--inner_bs", type=int, default=256)
+    parser.add_argument("--query_bs", type=int, default=256)
+
+    parser.add_argument("--meta_lr", type=float, default=2e-4)
+    parser.add_argument("--inner_lr", type=float, default=1e-2)
+
+    # extra switches
+    parser.add_argument(
+        "--freeze_bn",
+        action="store_true",
+        default=True,
+        help="Freeze BatchNorm running stats",
+    )
+    parser.add_argument(
+        "--use_gn", action="store_true", default=False, help="Replace BatchNorm with GroupNorm"
+    )
+    parser.add_argument(
+        "--init", type=str, default=f"JSCC/trained_models/CINIC10-awgn/best.pt",
+        help="Path to a supervised pre-training checkpoint"
+    )
+
+    # paths
+    parser.add_argument("--name", type=str, default="meta-cinic100")
+    parser.add_argument("--save_path", type=str, default="Meta-JSCC/trained_models")
+
     args = parser.parse_args()
+    args.num_classes = infer_num_classes(args.dataset)  # regex-based
+    args.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.save_path, exist_ok=True)
 
-    # Define TASKS here for the script to be self-contained
-    TASKS = [
-        {'dataset': 'cifar10', 'channel': 'AWGN', 'snr': 0},
-        {'dataset': 'cifar10', 'channel': 'AWGN', 'snr': 5},
-        {'dataset': 'cifar10', 'channel': 'AWGN', 'snr': 10},
-        {'dataset': 'cifar10', 'channel': 'AWGN', 'snr': 15},
-    ]
 
-    maml_train(args)
+
+    meta_train(args)

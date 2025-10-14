@@ -1,148 +1,55 @@
-# Deep JSCC
-This implements training of Deep JSCC models for wireless image transmission as described in the paper [Deep Joint Source-Channel Coding for Wireless Image Transmission](https://ieeexplore.ieee.org/abstract/document/8723589) by Pytorch. And there has been a [Tensorflow and keras implementations ](https://github.com/irdanish11/DJSCC-for-Wireless-Image-Transmission).
+# Discrete Task-oriented Joint Source-Channel Coding (DT-JSCC)
 
-This is my first time to use PyTorch and git to reproduce a paper, so there may be some mistakes. If you find any, please let me know. Thanks!
+This is a [Pytorch](https://pytorch.org/docs/stable/index.html) implementation of DT-JSCC for task-oriented communication with digital modulation, as proposed in the paper [Robust Information Bottleneck for Task-Oriented Communication with Digital Modulation](https://arxiv.org/abs/2209.10382).
 
+## Requirements
 
+The codes are compatible with the packages:
 
-## Update-2024.06.04
-- modify the `train.py` to omit most of the args in command line, you can just use `python train.py --dataset ${dataset_name}` to train the model.
-- add tensorboard to record the results in exp.
-- add the `visualization/` file to visualize the result.
-- add bash file to run the code in parallel.
+* pytorch 1.8.0
 
+* torchvision 0.9.0a0
 
+* numpy 1.23.1
 
-## Architecture
+* tensorboardX 2.4
 
-<div style="text-align: center;">
-    <img src="./demo/arc.png" alt="Image 1" style="width: 500px; height: 250px;">
-</div>
+The code can be run on the datasets such as [MNIST](http://yann.lecun.com/exdb/mnist/) and [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html), etc. One should download the datasets in a directory (e.g., `./data/`) and change the root parameter in `datasets/dataloader.py`, e.g., 
 
-## Demo
-
-
-The model trained on cifar10 which is 32\*32 but test on kodim which is 768\*512 (top); and the model trained on imagenet which is resized to 128\*128 but test on kodim which is 768\*512 (bottom).
-<div style="display: flex;">
-  <img src="./demo/cifar10_kodim08.png" alt="Image 1" style="flex: 1; max-width: 48%; height: auto;">
-  <div style="width: 5px;"></div> 
-  <img src="./demo/imagenet_kodim08.png" alt="Image 2" style="flex: 1; max-width: 48%; height: auto;">
-</div>
-
-
-## Installation
-conda or other virtual environment is recommended.
-
-```
-git clone https://github.com/chunbaobao/Deep-JSCC-PyTorch.git
-cd ./Deep-JSCC-PyTorch
-pip install requirements.txt
+```python
+root = r'./data/
 ```
 
-## Usage
-### Prepare Dataset
-The cifar10 dataset can be downloaded automatically by torchvision. But the imagenet dataset should be downloaded manually from [ImageNet website](https://image-net.org/) and put in the right place, refer to [dataset.py](https://github.com/chunbaobao/Deep-JSCC-PyTorch/blob/main/dataset.py#L28). And run:
-```
-python dataset.py 
-```
+## Run experiments
 
-### Training
-The training command used to be very long, but now you can just use `python train.py --dataset ${dataset_name} --channel ${channel}` to train the model. 
-The default dataset is cifar10.
-The parmeters can be modified in the `train.py` file. The default parameters are similar to the paper.
+### Training the DT-JSCC model
 
+1. Training the DT-JSCC on the MNIST dataset
+   
+   `python main.py --dataset MNIST --channels 1 --lam 1e-3 --lr 1e-3 --epoches 400 --latent_d 64 --num_latent 16 --num_embeddings 16 --psnr 4`
 
-| Parameters                   | CIFAR-10         | ImageNet         |
-|------------------------|------------------|------------------|
-| `batch_size`           | 64               | 32               |
-| `init_lr`              | 1e-3             | 1e-4             |
-| `weight_decay`         | 5e-4             | 5e-4             |
-| `snr_list`             | [19, 13, 7, 4, 1]| [19, 13, 7, 4, 1]|
-| `ratio_list`           | [1/6, 1/12]      | [1/6, 1/12]      |
-| `if_scheduler`         | True             | False            |
-| `step_size`            | 640              | N/A              |
-| `gamma`                | 0.1              | 0.1              |
+2. Training the DT-JSCC on the CIFAR-10 dataset
+   
+   `python main.py --dataset CIFAR10 --mod psk --lam 1e-3 --lr 1e-3 --epoches 320 --num_embeddings 16 --psnr 4`
 
+The parameter `num_embeddings` is the size of trainable codebook $K$, the parameter `latent_d` is the length of codeword $D$, the `num_latent` is the dimension $d$ of encoded representation $\mathbf{z}$  and the `psnr` is the PSNR of AWGN channel. In the experiments, $Dd = 1024$ for MNIST dataset and $D=512$ and $d=16$ for CIFAR-10 dataset.
 
+### Evaluating the trained DT-JSCC model
 
-<!-- ALSO! The batch_size for cifar10 training in the paper is small causing the GPU utilization is low. So The bash script is provided to run the code in parallel for different snr and ratio for cifar10 dataset. (Example of two GPUs)
-```
-bash parallel_train_cifar.sh --channel ${channel}
-``` -->
+`python evaluate.py --dataset CIFAR10 --save_root ./results --name CIFAR10-num_e16-num_latent4-modpsk-snr10.0-lam0.0`  
 
-
-
-### Evaluation
-The `eval.py` provides the evaluation of the trained model. 
-
-You may need modify slightly to evaluate the model for different snr_list and channel type in `main` function. 
-```
-python eval.py
-```
-All training and evaluation results are saved in the `./out` directory by default. The `./out` directory may contain the structure as follows:
-```
-./out
-├── checkpoint # trained models
-│   ├── $DATASETNAME_$INNERCHANNEL_$SNR_$RATIO_$CHANNEL_TYPE_$TIMES_on_$DATE
-│       ├── epoch_$num.pth
-│       ├── ...
-│   ├── CIFAR10_10_1.0_0.08_AWGN_13h21m37s_on_Jun_02_2024
-│   ├── CIFAR10_20_7.0_0.17_Rayleigh_14h03m19s_on_Jun_03_2024
-│   ├── ...
-├── configs # training configurations
-│   ├── $DATASETNAME_$INNERCHANNEL_$SNR_$RATIO_$CHANNEL_TYPE_$TIMES_on_$DATE
-│   ├── $CIFAR10_10_4.0_0.08_AWGN_13h21m38s_on_Jun_02_2024.yaml
-│   ├── ...
-├── logs # training logs
-│   ├── $DATASETNAME_$INNERCHANNEL_$SNR_$RATIO_$CHANNEL_TYPE_$TIMES_on_$DATE
-│       ├── tensorboard logs
-│   ├── ...
-├── eval # evaluation results
-│   ├── $DATASETNAME_$INNERCHANNEL_$SNR_$RATIO_$CHANNEL_TYPE_$TIMES_on_$DATE
-│       ├── tensorboard logs
-│   ├── ...
-```
-### Visualization
-
-The `./visualization` directory contains the scripts for visualization of the training and evaluation results.
-
-- `single_visualization.ipynb` is used to get demo of the model on single image like the demo above.
-- `plot_visualization.ipynb` is used to get visualizations of the perfprmance of the model on different snr and ratio.
-
-## Results
-
-
-
- 
-<div style="display: flex;">
-  <img src="demo/cifar_0.08_AWGN.png" alt="Image 1" style="flex: 1; max-width: 48%; height: auto;">
-  <div style="width: 0px;"></div> <!-- 为了让两个图像之间有一点间距 -->
-  <img src="demo/cifar_0.17_AWGN.png" alt="Image 2" style="flex: 1; max-width: 48%; height: auto;">
-</div>
-
-<div style="display: flex;">
-  <img src="demo/cifar_0.17_Rayleigh.png" alt="Image 1" style="flex: 1; max-width: 48%; height: auto;">
-  <div style="width: 0px;"></div> <!-- 为了让两个图像之间有一点间距 -->
-  <img src="demo/cifar_0.34_Rayleigh.png" alt="Image 2" style="flex: 1; max-width: 48%; height: auto;">
-</div>
-
-
-
-
-### TO-DO
-- ~~Add visualization of the model~~
-- ~~plot the results with different snr and ratio~~
-- ~~add Rayleigh channel~~
-- train on imagenet
-- **Convert the real communication system to a complex communication system**
+The parameter `name` is the trained model.
 
 ## Citation
-If you find (part of) this code useful for your research, please consider citing
 ```
-@misc{chunhang_Deep-JSCC,
-  author = {chunhang},
-  title = {a pytorch implementation of Deep JSCC},
-  url ={https://github.com/chunbaobao/Deep-JSCC-PyTorch},
-  year = {2023}
+@article{xie2022robust,
+  title={Robust Information Bottleneck for Task-Oriented Communication with Digital Modulation},
+  author={Xie, Songjie and Wu, Youlong and Ma, Shuai and Ding, Ming and Shi, Yuanming and Tang, Mingjian},
+  journal={arXiv preprint arXiv:2209.10382},
+  year={2022}
 }
+```
+
+
+
 

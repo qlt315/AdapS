@@ -1,218 +1,171 @@
-# md_train_final.py
-import os
-import torch
-import torch.nn as nn
-from torchvision import transforms
-from torchvision import datasets
-from torch.utils.data import DataLoader
-import torch.optim as optim
-from tqdm import tqdm
-from model import DeepJSCC_MultiDecoder, ratio2filtersize, _Encoder, _Decoder
-from channel import Channel
-from utils import image_normalization, set_seed, get_psnr
-from fractions import Fraction
-from dataset import Cifar10Modified, Vanilla
-import numpy as np
-import time
+import os, torch, torch.optim as optim, torch.optim.lr_scheduler as lr_scheduler
 from tensorboardX import SummaryWriter
-import yaml
-import random
-from torch.nn.parallel import DataParallel
+import re
+import model.DT_JSCC as JSCC_model         # multi-decoder version
+from model.losses import RIBLoss
+from datasets.dataloader import get_data
+from engine import train_one_epoch, test
+from utils.modulation import QAM, PSK
 
-def train_epoch(model, optimizer, param, data_loader_dict, tasks, snr):
-    model.train()
-    epoch_loss = 0
-    main_loader = data_loader_dict[param['base_dataset']]['train']
-    other_loader_iters = {name: iter(loader['train']) for name, loader in data_loader_dict.items() if
-                          name != param['base_dataset']}
+# ----------------------------- regex helpers ------------------------------ #
+# Match dataset base at the beginning: cifar100 / cifar10 / cinic10,
+# followed by a word boundary, underscore, hyphen, or end of string.
+_DATASET_BASE_RE = re.compile(r'^(cifar100|cifar10|cinic10)(?=\b|[_-]|$)', flags=re.IGNORECASE)
 
-    for images, _ in tqdm(main_loader, desc=f"Training Epoch"):
-        task = random.choice(tasks)
-        dataset_name, channel_type = task['dataset'], task['channel']
-        task_name = f"{dataset_name}_{channel_type}"
+def detect_base(dataset_name: str) -> str:
+    """Return canonical base name in UPPER (CIFAR10 / CIFAR100 / CINIC10) via regex."""
+    ds = str(dataset_name).strip()
+    m = _DATASET_BASE_RE.match(ds)
+    if not m:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    return m.group(1).upper()
 
-        if dataset_name != param['base_dataset']:
-            try:
-                images, _ = next(other_loader_iters[dataset_name])
-            except StopIteration:
-                other_loader_iters[dataset_name] = iter(data_loader_dict[dataset_name]['train'])
-                images, _ = next(other_loader_iters[dataset_name])
+def infer_num_classes(dataset_name: str) -> int:
+    """Infer number of classes based on regex-detected dataset base."""
+    base = detect_base(dataset_name)
+    if base == "CIFAR100":
+        return 100
+    if base in ("CIFAR10", "CINIC10"):
+        return 10
+    # Unreachable due to detect_base guard
+    raise ValueError(f"Unknown dataset for inferring num_classes: {dataset_name}")
 
-        images = images.to(param['device'])
-        channel = Channel(channel_type=channel_type, snr=snr).to(param['device'])
+# --------------------------------------------------------------------------- #
+def build_mod(mod_type, n_emb, psnr, channel, ch_args):
+    """Factory for QAM / PSK modulators."""
+    cls = QAM if str(mod_type).lower() == "qam" else PSK
+    return cls(n_emb, psnr, channel, ch_args)
 
-        optimizer.zero_grad()
-        outputs = model(images, task_name=task_name, channel=channel)
-        outputs = image_normalization('denormalization')(outputs)
-        images = image_normalization('denormalization')(images)
-        loss = model.loss(images, outputs)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
+# --------------------------------------------------------------------------- #
+def main(args):
+    # ============ 1) Build task list ======================================
+    # Choose tasks (dataset, channel, unique task_key) using regex-detected base.
+    base = detect_base(args.dataset)  # "CIFAR10" / "CIFAR100" / "CINIC10"
 
-    return epoch_loss / len(main_loader)
+    tasks = [
+        (base, "awgn",   f"{base}_awgn"),
+        (f"{base}_noise", "awgn", f"{base}_noise_awgn"),
+        (base, "rician", f"{base}_rician"),
+    ]
+    task_keys = [k for _, _, k in tasks]  # pass to model for head selection
 
+    # ============ 2) Model =================================================
+    # Select model class by regex-detected base.
+    if base == "CIFAR10":
+        model = JSCC_model.DTJSCC_CIFAR10(
+            args.in_channels, args.latent_d, args.num_classes,
+            task_keys=task_keys, num_embeddings=args.num_embeddings
+        )
+    elif base == "CIFAR100":
+        model = JSCC_model.DTJSCC_CIFAR100(
+            args.in_channels, args.latent_d, args.num_classes,
+            task_keys=task_keys, num_embeddings=args.num_embeddings
+        )
+    elif base == "CINIC10":
+        model = JSCC_model.DTJSCC_CINIC10(
+            args.in_channels, args.latent_d, args.num_classes,
+            task_keys=task_keys, num_embeddings=args.num_embeddings
+        )
+    else:
+        # Should not happen due to detect_base
+        raise ValueError(f"No available model for dataset: {args.dataset}, please check model/DT_JSCC.py.")
+    model.to(args.device)
 
-def evaluate_epoch(model, param, data_loader_dict, tasks, snr):
-    model.eval()
-    criterion = nn.MSELoss()
-    task_results = {}
-    with torch.no_grad():
-        for task in tqdm(tasks, desc="Evaluating Tasks"):
-            dataset_name, channel_type = task['dataset'], task['channel']
-            task_name = f"{dataset_name}_{channel_type}"
-            test_loader = data_loader_dict[dataset_name]['test']
-            channel = Channel(channel_type=channel_type, snr=snr).to(param['device'])
+    # ============ 3) Optimizer / LR schedule ===============================
+    optimizer  = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler  = lr_scheduler.StepLR(optimizer, step_size=80, gamma=0.5)
+    criterion  = RIBLoss(args.lam)
 
-            total_mse = 0
-            for images, _ in test_loader:
-                images = images.to(param['device'])
-                outputs = model(images, task_name=task_name, channel=channel)
+    # ============ 4) DataLoaders per task =================================
+    # Each task has its own training loader (by dataset name string),
+    # while validation uses the original args.dataset string (may include suffix).
+    loaders = {d: get_data(d, args.N, n_worker=8, train=True) for d, _, _ in tasks}
+    val_loader = get_data(args.dataset, args.N, n_worker=8, train=False)
 
-                ### --- THIS IS THE CORRECTED PART --- ###
-                # Denormalize both tensors to [0, 255] range before calculating MSE.
-                # This ensures consistency with your training loss calculation.
-                outputs = image_normalization('denormalization')(outputs)
-                images = image_normalization('denormalization')(images)
+    # ============ 5) Logging / checkpoint =================================
+    writer = SummaryWriter(os.path.join("MD-JSCC/logs", args.name))
+    best_acc, start_epoch = 0.0, 0
+    last_ckpt = os.path.join(args.ckpt_dir, f"{detect_base(args.dataset).lower()}_last.pt")
 
-                mse = criterion(outputs, images)
-                total_mse += mse.item()
+    # ============ 6) Training loop ========================================
+    for epoch in range(start_epoch, args.epochs):
 
-            avg_mse = total_mse / len(test_loader)
+        # ----- iterate over tasks (multi-decoder heads) --------------------
+        for dname, ch_type, key in tasks:
+            ch_args = {"K": args.K} if ch_type == "rician" else \
+                      {"m": args.m} if ch_type == "nakagami" else {}
+            mod = build_mod(args.mod, args.num_embeddings, args.psnr, ch_type, ch_args)
 
-            # Use the standard PSNR formula for 8-bit images (MAX_I = 255).
-            if avg_mse > 0:
-                psnr = 10 * np.log10(255 ** 2 / avg_mse)
-            else:
-                psnr = float('inf')
+            train_one_epoch(
+                loaders[dname], model, optimizer, criterion,
+                writer, epoch, mod=mod, args=args, task_key=key
+            )
 
-            task_results[task_name] = {"psnr": psnr, "loss": avg_mse}
+        scheduler.step()
 
-    for name, results in task_results.items():
-        print(f"  - Val PSNR on {name}: {results['psnr']:.2f} dB")
+        # ----- periodic validation ----------------------------------------
+        if epoch % 5 == 0:
+            val_mod = build_mod(args.mod, args.num_embeddings, args.psnr, 'awgn', {})
+            val_task_key = f"{base}_awgn"
+            acc = test(
+                val_loader, model, criterion, writer,
+                epoch, mod=val_mod, args=args, task_key=val_task_key
+            )
+            if acc > best_acc:
+                best_acc = acc
+                torch.save(
+                    {"epoch": epoch, "model_states": model.state_dict()},
+                    os.path.join(args.ckpt_dir, f"{detect_base(args.dataset).lower()}_best.pt")
+                )
 
-    avg_loss_for_scheduler = np.mean([res['loss'] for res in task_results.values()])
-    avg_psnr = np.mean([res['psnr'] for res in task_results.values()])
-    return avg_loss_for_scheduler, avg_psnr
+        # ----- always save last -------------------------------------------
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_states": model.state_dict(),
+                "optimizer_states": optimizer.state_dict(),
+                "scheduler_states": scheduler.state_dict(),
+                "best_acc": best_acc
+            },
+            last_ckpt
+        )
 
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    import argparse, multiprocessing as mp
 
-def train_pipeline(params, tasks):
-    """
-    The core training pipeline, now with model saving logic included.
-    """
-    # --- Data Loading (No changes needed here) ---
-    dataloaders = {}
-    transform = transforms.Compose([transforms.ToTensor()])
-    unique_datasets = sorted(list(set(task['dataset'] for task in tasks)))
-    batch_size = params.get('batch_size', 32)
-    num_workers = params.get('num_workers', 0)
-    for d_name in unique_datasets:
-        print(f"Loading dataset: {d_name}...")
-        if d_name == 'cifar10':
-            train_dset = datasets.CIFAR10(root='dataset/', train=True, download=True, transform=transform)
-            test_dset = datasets.CIFAR10(root='dataset/', train=False, download=True, transform=transform)
-        elif d_name.startswith('cifar10_'):
-            train_dset = Cifar10Modified(d_name, transform=transform, train=True)
-            test_dset = Cifar10Modified(d_name, transform=transform, train=False)
-        else:
-            raise NotImplementedError(f"Dataset loading for {d_name} not implemented.")
-        dataloaders[d_name] = {
-            'train': DataLoader(train_dset, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-            'test': DataLoader(test_dset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-        }
+    parser = argparse.ArgumentParser("Joint-task Multi-Decoder Trainer")
+    # --------- CLI arguments ----------
+    parser.add_argument("--dataset", type=str, default="CIFAR100")
+    parser.add_argument("--root",    type=str, default="MD-JSCC/trained_models")
+    parser.add_argument("--device",  type=str, default="cuda:0")
+    parser.add_argument("--mod",     type=str, default="psk")
+    parser.add_argument("--num_latent", type=int, default=4)
+    parser.add_argument("--latent_d",   type=int, default=512)
+    parser.add_argument('--in_channels', type=int, default=3, help='Image input channels')
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--N",      type=int, default=256)
+    parser.add_argument("--lr",     type=float, default=1e-3)
+    parser.add_argument("--maxnorm",type=float, default=1.)
+    parser.add_argument("--num_embeddings", type=int, default=16)
+    parser.add_argument("--lam",    type=float, default=0.0)
+    parser.add_argument("--psnr",   type=float, default=8.0)
+    parser.add_argument("--K", type=float, default=3.0)
+    parser.add_argument("--m", type=float, default=2.0)
 
-    # --- Model Creation (No changes needed here) ---
-    image_first, _ = dataloaders[params['base_dataset']]['train'].dataset[0]
-    c = ratio2filtersize(image_first, params['fixed_ratio'])
-    model = DeepJSCC_MultiDecoder(c=c, tasks=tasks).to(params['device'])
-    print(
-        f"Training a Multi-Decoder model. Base Channel Dim: {c}, Ratio: {params['fixed_ratio']:.2f}, Fixed SNR: {params['fixed_snr']}dB")
+    args = parser.parse_args()
 
-    # ### MODIFICATION 1: Create checkpoint directory ###
-    # --- Experiment Directories and Tensorboard Writer ---
-    out_dir = params['out_dir']
-    phaser = 'MD-JSCC_' + time.strftime('%Y%m%d_%H%M%S')
-    log_dir = os.path.join(out_dir, 'logs', phaser)
-    ckpt_dir = os.path.join(out_dir, 'checkpoints', phaser)  # Directory for model checkpoints
-    os.makedirs(log_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)  # Create the checkpoint directory
+    # ---- regex-based inferences & names ----
+    args.num_classes = infer_num_classes(args.dataset)  # uses regex
+    args.device   = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    args.ckpt_dir = os.path.join(args.root)
 
-    writer = SummaryWriter(log_dir=log_dir)
+    base_upper = detect_base(args.dataset)   # "CIFAR10" / "CIFAR100" / "CINIC10"
+    ds_base = base_upper.lower()             # "cifar10" / "cifar100" / "cinic10"
+    args.name = f"md-{ds_base}"
+    os.makedirs(args.ckpt_dir, exist_ok=True)
 
-    # --- Model and Optimizer Initialization (No changes needed here) ---
-    device = torch.device(params['device'])
-    model = model.to(device)
-    if params.get('parallel', False): model = DataParallel(model)
-    optimizer = optim.Adam(model.parameters(), lr=params['init_lr'], weight_decay=params.get('weight_decay', 0))
-    scheduler = None
-    if params.get('if_scheduler', False) and params.get('reduce_on_plateau', False):
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=params['lr_reduce_factor'],
-                                                         patience=params['lr_schedule_patience'])
+    # Global TensorBoard step
+    args.n_iter = 0
 
-    # --- Main Training Loop ---
-    latest_val_psnr = 0.0
-    best_val_psnr = 0.0  # Variable to keep track of the best performance
-
-    for epoch in range(params['epochs']):
-        print(f"\n--- Epoch {epoch + 1}/{params['epochs']} ---")
-        epoch_train_loss = train_epoch(model, optimizer, params, dataloaders, tasks, params['fixed_snr'])
-        writer.add_scalar('train_loss_avg', epoch_train_loss, epoch + 1)
-
-        eval_freq = params.get('eval_frequency', 1)
-        if (epoch + 1) % eval_freq == 0 or (epoch + 1) == params['epochs']:
-            print(f"--- Running evaluation for Epoch {epoch + 1} ---")
-            epoch_val_loss, epoch_val_psnr = evaluate_epoch(model, params, dataloaders, tasks, params['fixed_snr'])
-            latest_val_psnr = epoch_val_psnr
-            writer.add_scalar('val_psnr_avg', epoch_val_psnr, epoch + 1)
-            if scheduler is not None:
-                scheduler.step(epoch_val_loss)
-
-            # ### MODIFICATION 2: Add model saving logic ###
-            # -----------------------------------------------------------
-            # Always save the latest model checkpoint after an evaluation.
-            latest_ckpt_path = os.path.join(ckpt_dir, 'checkpoint_latest.pth')
-            torch.save(model.state_dict(), latest_ckpt_path)
-            print(f"Saved latest checkpoint to: {latest_ckpt_path}")
-
-            # Save another copy only if it's the best performing model so far.
-            if latest_val_psnr > best_val_psnr:
-                best_val_psnr = latest_val_psnr
-                best_ckpt_path = os.path.join(ckpt_dir, 'checkpoint_best.pth')
-                torch.save(model.state_dict(), best_ckpt_path)
-                print(f"New best performance! Saved best checkpoint to: {best_ckpt_path}")
-            # -----------------------------------------------------------
-
-        current_lr = optimizer.param_groups[0]['lr']
-        writer.add_scalar('learning_rate', current_lr, epoch + 1)
-        print(
-            f"Epoch {epoch + 1} finished. Train Loss: {epoch_train_loss:.4f}, Last Val PSNR: {latest_val_psnr:.2f}, LR: {current_lr:.6f}")
-
-    print("Training complete.")
-
-
-def main():
-    # Set the hardcoded path to your config file
-    config_path = 'MD-JSCC/md_config.yaml'
-
-    print(f" Starting Multi-Task Joint Training from hardcoded config file: {config_path}")
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Configuration file not found at '{config_path}'. Please create it.")
-
-    with open(config_path, 'r') as f:
-        params = yaml.safe_load(f)
-
-    # Ensure required keys exist with default values if necessary
-    params['fixed_ratio'] = float(Fraction(params.get('fixed_ratio', '1/12')))
-
-    try:
-        tasks_to_train = params['training_tasks']
-    except KeyError:
-        raise ValueError("The 'training_tasks' list must be defined in your config.yaml file.")
-
-    # Call the main training pipeline
-    train_pipeline(params, tasks_to_train)
-
-
-if __name__ == '__main__':
-    main()
+    main(args)
